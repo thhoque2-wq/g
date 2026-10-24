@@ -1,0 +1,498 @@
+name: Build Lucky Flag Race APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-apk.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare Android SDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKM" ]; then
+            yes | "$SDKM" --licenses > /dev/null || true
+            "$SDKM" "platforms;android-35" "build-tools;35.0.0" || true
+          fi
+
+      - name: Create Gradle files
+        run: |
+          mkdir -p flagrace/app/src/main/java/com/flagrace/app
+          mkdir -p flagrace/app/src/main/res/drawable
+          cd flagrace
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "FlagRace"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.flagrace.app"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.flagrace.app"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+
+      - name: Create manifest and resources
+        run: |
+          cd flagrace/app/src/main
+
+          cat > AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="Lucky Flag Race"
+                  android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="portrait"
+                      android:keepScreenOn="true"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > res/drawable/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#1565C0" android:pathData="M0,0h108v108h-108z" />
+              <path android:fillColor="#FFD700" android:pathData="M54,20 L64,45 L90,45 L69,60 L77,85 L54,70 L31,85 L39,60 L18,45 L44,45 Z" />
+          </vector>
+          EOF
+
+      - name: Create Game Engine
+        run: |
+          cat > flagrace/app/src/main/java/com/flagrace/app/GameView.kt <<'EOF'
+          package com.flagrace.app
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.view.SurfaceHolder
+          import android.view.SurfaceView
+          import kotlin.math.sqrt
+          import kotlin.math.abs
+          import kotlin.random.Random
+
+          class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback {
+
+              private var gameThread: GameThread? = null
+              @Volatile var isRunning = false
+
+              // Game Settings
+              val gravity = 0.4f
+              val bounceForce = 2.5f
+              val flagRadius = 35f
+              val pegRadius = 18f
+              
+              var state = "RACING" // RACING, FINISHED
+              var countdown = 0
+
+              data class Racer(
+                  val id: Int,
+                  val flag: String,
+                  val name: String,
+                  val color: Int,
+                  var x: Float,
+                  var y: Float,
+                  var vx: Float,
+                  var vy: Float,
+                  var finishedRank: Int = -1
+              )
+
+              data class Peg(val x: Float, val y: Float)
+
+              val racers = mutableListOf<Racer>()
+              val pegs = mutableListOf<Peg>()
+              val finishOrder = mutableListOf<Racer>()
+              var finishLineY = 0f
+
+              init {
+                  holder.addCallback(this)
+              }
+
+              fun initGame() {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  if (w == 0f || h == 0f) return
+
+                  racers.clear()
+                  pegs.clear()
+                  finishOrder.clear()
+                  state = "RACING"
+                  countdown = 0
+
+                  // Define Flags
+                  val flagsData = listOf(
+                      Triple("🇧🇩", "Bangladesh", Color.rgb(0, 106, 78)),
+                      Triple("🇧🇷", "Brazil", Color.rgb(0, 156, 59)),
+                      Triple("🇺🇸", "USA", Color.rgb(178, 34, 52)),
+                      Triple("🇻🇳", "Vietnam", Color.rgb(218, 37, 29)),
+                      Triple("🇮🇳", "India", Color.rgb(255, 153, 51)),
+                      Triple("🇯🇵", "Japan", Color.rgb(188, 0, 45)),
+                      Triple("🇰🇷", "S.Korea", Color.rgb(205, 46, 58)),
+                      Triple("🇬🇧", "UK", Color.rgb(1, 33, 105)),
+                      Triple("🇩🇪", "Germany", Color.rgb(255, 206, 0)),
+                      Triple("🇦🇺", "Australia", Color.rgb(0, 0, 139))
+                  )
+
+                  val startY = 100f
+                  val spacing = w / (flagsData.size + 1)
+
+                  for (i in flagsData.indices) {
+                      val (flag, name, color) = flagsData[i]
+                      racers.add(
+                          Racer(
+                              id = i, flag = flag, name = name, color = color,
+                              x = spacing * (i + 1),
+                              y = startY,
+                              vx = Random.nextFloat() * 4f - 2f,
+                              vy = 0f
+                          )
+                      )
+                  }
+
+                  // Create Pegs (Obstacles)
+                  val rows = 12
+                  val startPegY = 300f
+                  val endPegY = h - 300f
+                  val rowSpacing = (endPegY - startPegY) / rows
+
+                  for (r in 0 until rows) {
+                      val y = startPegY + (r * rowSpacing)
+                      val isOffset = r % 2 == 0
+                      val cols = if (isOffset) 7 else 8
+                      val startX = if (isOffset) w / 8 else w / 7
+
+                      for (c in 0 until cols) {
+                          val x = if (isOffset) startX + (c * w / 4) else startX + (c * w / 4)
+                          if (x > 40 && x < w - 40) {
+                              pegs.add(Peg(x, y))
+                          }
+                      }
+                  }
+
+                  finishLineY = h - 150f
+              }
+
+              fun updatePhysics() {
+                  if (state == "FINISHED") {
+                      countdown++
+                      if (countdown > 60 * 8) { // 8 seconds after finish, restart
+                          initGame()
+                      }
+                      return
+                  }
+
+                  for (racer in racers) {
+                      if (racer.finishedRank != -1) continue
+
+                      // Apply Gravity
+                      racer.vy += gravity
+                      racer.x += racer.vx
+                      racer.y += racer.vy
+
+                      // Wall Collision
+                      if (racer.x < flagRadius) {
+                          racer.x = flagRadius
+                          racer.vx = abs(racer.vx) * 0.8f
+                      } else if (racer.x > width - flagRadius) {
+                          racer.x = width - flagRadius
+                          racer.vx = -abs(racer.vx) * 0.8f
+                      }
+
+                      // Peg Collision
+                      for (peg in pegs) {
+                          val dx = racer.x - peg.x
+                          val dy = racer.y - peg.y
+                          val dist = sqrt(dx * dx + dy * dy)
+                          val minDist = flagRadius + pegRadius
+
+                          if (dist < minDist) {
+                              // Resolve overlapping
+                              val nx = dx / dist
+                              val ny = dy / dist
+                              racer.x = peg.x + nx * minDist
+                              racer.y = peg.y + ny * minDist
+
+                              // Bounce off peg randomly
+                              racer.vx = nx * bounceForce + (Random.nextFloat() * 4f - 2f)
+                              racer.vy = ny * bounceForce * 0.5f + Random.nextFloat() * 2f
+                          }
+                      }
+
+                      // Check Finish Line
+                      if (racer.y >= finishLineY) {
+                          racer.y = finishLineY
+                          racer.finishedRank = finishOrder.size + 1
+                          finishOrder.add(racer)
+                          
+                          if (finishOrder.size == 1) {
+                              state = "FINISHED"
+                              countdown = 0
+                          }
+                      }
+                  }
+              }
+              
+              override fun surfaceCreated(holder: SurfaceHolder) {
+                  isRunning = true
+                  gameThread = GameThread(this, holder)
+                  gameThread?.start()
+              }
+
+              override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                  initGame()
+              }
+
+              override fun surfaceDestroyed(holder: SurfaceHolder) {
+                  isRunning = false
+                  gameThread?.join()
+              }
+          }
+          EOF
+
+          cat > flagrace/app/src/main/java/com/flagrace/app/GameThread.kt <<'EOF'
+          package com.flagrace.app
+
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.view.SurfaceHolder
+
+          class GameThread(
+              private val gameView: GameView,
+              private val holder: SurfaceHolder
+          ) : Thread() {
+
+              private var isRunning = true
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.WHITE
+                  textSize = 40f
+                  textAlign = Paint.Align.CENTER
+              }
+
+              override fun run() {
+                  var lastTime = System.nanoTime()
+                  while (isRunning) {
+                      val now = System.nanoTime()
+                      val delta = (now - lastTime) / 1_000_000f
+                      lastTime = now
+
+                      if (delta < 16) {
+                          try { sleep((16 - delta).toLong()) } catch (e: InterruptedException) {}
+                      }
+
+                      gameView.updatePhysics()
+
+                      var canvas: Canvas? = null
+                      try {
+                          canvas = holder.lockCanvas()
+                          if (canvas != null) {
+                              synchronized(holder) { draw(canvas) }
+                          }
+                      } finally {
+                          if (canvas != null) holder.unlockCanvasAndPost(canvas)
+                      }
+                  }
+              }
+
+              private fun draw(canvas: Canvas) {
+                  val w = canvas.width.toFloat()
+                  val h = canvas.height.toFloat()
+
+                  // Background
+                  paint.color = Color.rgb(79, 156, 219) // Light blue like image
+                  canvas.drawRect(0f, 0f, w, h, paint)
+
+                  // Draw Finish Line
+                  paint.color = Color.WHITE
+                  paint.strokeWidth = 10f
+                  canvas.drawLine(0f, gameView.finishLineY, w, gameView.finishLineY, paint)
+                  
+                  // Checkered pattern for finish line
+                  paint.color = Color.BLACK
+                  for (i in 0 until (w / 40).toInt()) {
+                      if (i % 2 == 0) {
+                          canvas.drawRect(i * 40f, gameView.finishLineY - 20f, (i + 1) * 40f, gameView.finishLineY, paint)
+                      }
+                  }
+
+                  // Draw Pegs
+                  paint.color = Color.rgb(20, 30, 70) // Dark blue pegs
+                  paint.style = Paint.Style.FILL
+                  for (peg in gameView.pegs) {
+                      canvas.drawCircle(peg.x, peg.y, gameView.pegRadius, paint)
+                      // Draw small shadow
+                      paint.color = Color.argb(100, 0, 0, 0)
+                      canvas.drawCircle(peg.x + 3f, peg.y + 3f, gameView.pegRadius, paint)
+                      paint.color = Color.rgb(20, 30, 70)
+                  }
+
+                  // Draw Racers
+                  for (racer in gameView.racers) {
+                      // Draw Flag Background
+                      paint.color = Color.WHITE
+                      canvas.drawCircle(racer.x, racer.y, gameView.flagRadius, paint)
+                      
+                      // Draw Flag Emoji
+                      textPaint.textSize = 45f
+                      canvas.drawText(racer.flag, racer.x, racer.y + 15f, textPaint)
+
+                      // Draw Name
+                      textPaint.textSize = 25f
+                      textPaint.color = Color.BLACK
+                      textPaint.typeface = android.graphics.Typeface.DEFAULT_BOLD
+                      canvas.drawText(racer.name, racer.x, racer.y - gameView.flagRadius - 5f, textPaint)
+                  }
+
+                  // Draw Leaderboard (Top Right)
+                  val lbPaint = Paint().apply { color = Color.argb(180, 0, 0, 0) }
+                  canvas.drawRect(w - 320f, 30f, w - 20f, 320f, lbPaint)
+                  
+                  textPaint.textAlign = Paint.Align.LEFT
+                  textPaint.color = Color.YELLOW
+                  textPaint.textSize = 30f
+                  canvas.drawText("🏆 POSITIONS", w - 300f, 70f, textPaint)
+
+                  textPaint.color = Color.WHITE
+                  textPaint.textSize = 25f
+                  var yPos = 110f
+
+                  val activeRacers = gameView.racers.filter { it.finishedRank == -1 }.sortedByDescending { it.y }
+                  val finishedRacers = gameView.finishOrder
+
+                  for ((index, r) in finishedRacers.withIndex()) {
+                      if (index < 5) {
+                          canvas.drawText("${index + 1}. ${r.flag} ${r.name}", w - 300f, yPos, textPaint)
+                          yPos += 35f
+                      }
+                  }
+
+                  for (r in activeRacers) {
+                      if (yPos > 300f) break
+                      val pos = finishedRacers.size + activeRacers.indexOf(r) + 1
+                      canvas.drawText("$pos. ${r.flag} ${r.name}", w - 300f, yPos, textPaint)
+                      yPos += 35f
+                  }
+
+                  // Draw Winner Screen
+                  if (gameView.state == "FINISHED" && gameView.finishOrder.isNotEmpty()) {
+                      paint.color = Color.argb(200, 0, 0, 0)
+                      canvas.drawRect(0f, h / 2 - 200f, w, h / 2 + 200f, paint)
+
+                      textPaint.textAlign = Paint.Align.CENTER
+                      textPaint.color = Color.YELLOW
+                      textPaint.textSize = 60f
+                      canvas.drawText("WINNER!", w / 2, h / 2 - 120f, textPaint)
+
+                      val winner = gameView.finishOrder[0]
+                      textPaint.textSize = 100f
+                      canvas.drawText(winner.flag, w / 2, h / 2 - 10f, textPaint)
+
+                      textPaint.color = Color.WHITE
+                      textPaint.textSize = 40f
+                      canvas.drawText(winner.name, w / 2, h / 2 + 60f, textPaint)
+
+                      textPaint.color = Color.LTGRAY
+                      textPaint.textSize = 25f
+                      canvas.drawText("Restarting in a moment...", w / 2, h / 2 + 120f, textPaint)
+                  }
+              }
+          }
+          EOF
+
+          cat > flagrace/app/src/main/java/com/flagrace/app/MainActivity.kt <<'EOF'
+          package com.flagrace.app
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.view.WindowManager
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  setContentView(GameView(this))
+              }
+          }
+          EOF
+
+      - name: Show generated project
+        run: find flagrace -type f | sort
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build debug APK
+        working-directory: flagrace
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lucky-Flag-Race-APK
+          path: flagrace/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
